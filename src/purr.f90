@@ -223,9 +223,9 @@ contains
    allocate(gt(nermax))
    allocate(es(nsamp))
    allocate(xs(nsamp))
-   allocate(fis(ntemp,nsamp))
-   allocate(cap(ntemp,nsamp))
-   allocate(els(ntemp,nsamp))
+   allocate(fis(nsamp,ntemp))
+   allocate(cap(nsamp,ntemp))
+   allocate(els(nsamp,ntemp))
    arry=0.
    xs=0
 
@@ -1800,7 +1800,7 @@ contains
    real(kr)::sigf(5,nsig0,ntemp),tabl(nbin,5,ntemp)
    real(kr)::er(*),gnr(*),gfr(*),ggr(*),gxr(*),gt(*)
    real(kr)::es(nsamp),xs(nsamp)
-   real(kr)::cap(ntemp,nsamp),fis(ntemp,nsamp),els(ntemp,nsamp)
+   real(kr)::cap(nsamp,ntemp),fis(nsamp,ntemp),els(nsamp,ntemp)
    real(kr)::temp(ntemp)
    ! internals
    integer::navoid,i,nres,nrest,iladr,ne,ie,itemp,k,nr,jr
@@ -1839,6 +1839,8 @@ contains
    real(kr),parameter::tref=300.e0_kr
    real(kr),parameter::big=1.e6_kr
    real(kr),parameter::zero=0
+   integer,allocatable,save::btab(:)
+   real(kr)::bemin,binvw
    save navoid,binmin,elow
    rpi=sqrt(pi)
    izeroprob=0
@@ -1905,12 +1907,13 @@ contains
       rr=rann(kk)
       es(ie)=emin+espan*rr
       do itemp=1,ntemp
-         cap(itemp,ie)=0
-         fis(itemp,ie)=0
-         els(itemp,ie)=spot
+         cap(ie,itemp)=0
+         fis(ie,itemp)=0
+         els(ie,itemp)=spot
       enddo
    enddo
    call fsort(es,ne)
+   call mktsrch(es,ne,btab,bemin,binvw)
 
    !--loop over sequences
    do 170 k=1,nseq0
@@ -1929,8 +1932,10 @@ contains
    delr=chek1+chekn
    elo=er(jr)-delr
    ehi=er(jr)+delr
-   call fsrch(ehi,es,ne,i7,mfl)
-   call fsrch(elo,es,i7,i0,mfl)
+   ! same results as fsrch(ehi,es,ne,i7,mfl); fsrch(elo,es,i7,i0,mfl)
+   ! but starting from the previous result (resonances are ordered)
+   call tsrch(ehi,es,ne,ne,btab,bemin,binvw,i7)
+   call tsrch(elo,es,i7,ne,btab,bemin,binvw,i0)
    if (i0.eq.i7) go to 210
    it=i7-i0+1
    y=ctx*gt(jr)/2
@@ -1963,9 +1968,9 @@ contains
       a1=c1/test
       rew=y*a1
       aimw=x*a1
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i1.ge.i7) go to 370
 
@@ -1995,9 +2000,9 @@ contains
       f2=c5/(a5*a5+a3)
       rew=f1*(temp1-a4*y)+f2*(temp1-a5*y)
       aimw=f1*(a4*x+temp2)+f2*(a5*x+temp2)
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i2.ge.i7) go to 370
 
@@ -2029,9 +2034,9 @@ contains
       e3=d5/(a6*a6+a3)
       rew=e1*(temp1-a4*y)+e2*(temp1-a5*y)+e3*(temp1-a6*y)
       aimw=e1*(a4*x+temp2)+e2*(a5*x+temp2)+e3*(a6*x+temp2)
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i3.ge.i7) go to 370
 
@@ -2080,9 +2085,9 @@ contains
       aimw=a1*ti(i,n)+a2*ti(i-1,j)+a3*ti(i,j)+a4*ti(i+1,j)&
         +a5*ti(i,j+1)+pq*ti(i+1,j+1)
       aimw=aimw*aki
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i4.ge.i7) go to 370
    go to 320
@@ -2121,9 +2126,9 @@ contains
       aimw=a1*tis(i,n)+a2*tis(i-1,j)+a3*tis(i,j)+a4*tis(i+1,j)+&
         a5*tis(i,j+1)+pq*tis(i+1,j+1)
       aimw=aimw*aki
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i4.ge.i7) go to 370
 
@@ -2152,9 +2157,9 @@ contains
       e3=d5/(a6*a6+a3)
       rew=e1*(temp1-a4*y)+e2*(temp1-a5*y)+e3*(temp1-a6*y)
       aimw=e1*(a4*x+temp2)+e2*(a5*x+temp2)+e3*(a6*x+temp2)
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i5.ge.i7) go to 370
 
@@ -2181,9 +2186,9 @@ contains
       f2=c5/(a5*a5+a3)
       rew=f1*(temp1-a4*y)+f2*(temp1-a5*y)
       aimw=f1*(a4*x+temp2)+f2*(a5*x+temp2)
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
    if (i6.ge.i7) go to 370
 
@@ -2197,9 +2202,9 @@ contains
       a1=c1/test
       rew=y*a1
       aimw=x*a1
-      cap(itemp,ie)=cap(itemp,ie)+ccg*rew
-      fis(itemp,ie)=fis(itemp,ie)+ccf*rew
-      els(itemp,ie)=els(itemp,ie)+cc2*rew+cs2*aimw
+      cap(ie,itemp)=cap(ie,itemp)+ccg*rew
+      fis(ie,itemp)=fis(ie,itemp)+ccf*rew
+      els(ie,itemp)=els(ie,itemp)+cc2*rew+cs2*aimw
    enddo
   370 continue
 
@@ -2211,7 +2216,7 @@ contains
    !--eliminate negative elastic cross sections; reset to 1 microbarn
    do itemp=1,ntemp
       do ie=1,ne
-         if (els(itemp,ie).lt.-bkg(2)) els(itemp,ie)=-bkg(2)+1/big
+         if (els(ie,itemp).lt.-bkg(2)) els(ie,itemp)=-bkg(2)+1/big
       enddo
    enddo
 
@@ -2231,10 +2236,10 @@ contains
    capf=0
    fisf=0
    do ie=1,ne
-      totf=totf+els(1,ie)+fis(1,ie)+cap(1,ie)+bkg(1)
-      elsf=elsf+els(1,ie)+bkg(2)
-      capf=capf+cap(1,ie)+bkg(4)
-      fisf=fisf+fis(1,ie)+bkg(3)
+      totf=totf+els(ie,1)+fis(ie,1)+cap(ie,1)+bkg(1)
+      elsf=elsf+els(ie,1)+bkg(2)
+      capf=capf+cap(ie,1)+bkg(4)
+      fisf=fisf+fis(ie,1)+bkg(3)
    enddo
    totf=totf/ne
    elsf=elsf/ne
@@ -2260,9 +2265,9 @@ contains
       if (fisf.ne.zero) ffact=(sigi(3)+bkg(3))/fisf
       do ie=1,ne
          do itemp=1,ntemp
-            els(itemp,ie)=spot+(els(itemp,ie)-spot)*efact
-            cap(itemp,ie)=cap(itemp,ie)*cfact
-            fis(itemp,ie)=fis(itemp,ie)*ffact
+            els(ie,itemp)=spot+(els(ie,itemp)-spot)*efact
+            cap(ie,itemp)=cap(ie,itemp)*cfact
+            fis(ie,itemp)=fis(ie,itemp)*ffact
          enddo
       enddo
    endif
@@ -2275,7 +2280,7 @@ contains
    !--and zero accumulators
    if (iladr.eq.1) then
       do ie=1,ne
-         es(ie)=els(itemp,ie)+fis(itemp,ie)+cap(itemp,ie)+bkg(1)
+         es(ie)=els(ie,itemp)+fis(ie,itemp)+cap(ie,itemp)+bkg(1)
       enddo
       call fsort(es,ne)
       tmin(itemp)=es(1)
@@ -2328,7 +2333,7 @@ contains
 
    !--accumulate cross sections into tables
    do ie=1,ne
-      tot=els(itemp,ie)+fis(itemp,ie)+cap(itemp,ie)+bkg(1)
+      tot=els(ie,itemp)+fis(ie,itemp)+cap(ie,itemp)+bkg(1)
       if (tot.lt.tmin(itemp)) tmin(itemp)=tot
       if (tot.gt.tmax(itemp)) tmax(itemp)=tot
       call fsrch(tot,tval(1,itemp),nbin,ii,mfl)
@@ -2337,15 +2342,15 @@ contains
       tsum(itemp)=tsum(itemp)+1
       tabl(ii,1,itemp)=tabl(ii,1,itemp)+1
       tabl(ii,2,itemp)=tabl(ii,2,itemp)+tot
-      tabl(ii,3,itemp)=tabl(ii,3,itemp)+els(itemp,ie)+bkg(2)
-      tabl(ii,4,itemp)=tabl(ii,4,itemp)+fis(itemp,ie)+bkg(3)
-      tabl(ii,5,itemp)=tabl(ii,5,itemp)+cap(itemp,ie)+bkg(4)
+      tabl(ii,3,itemp)=tabl(ii,3,itemp)+els(ie,itemp)+bkg(2)
+      tabl(ii,4,itemp)=tabl(ii,4,itemp)+fis(ie,itemp)+bkg(3)
+      tabl(ii,5,itemp)=tabl(ii,5,itemp)+cap(ie,itemp)+bkg(4)
       do i=1,nsig0
          tem=sig0(i)/(sig0(i)+tot)
          bval(1,i,itemp)=bval(1,i,itemp)+tot*tem
-         bval(2,i,itemp)=bval(2,i,itemp)+(els(itemp,ie)+bkg(2))*tem
-         bval(3,i,itemp)=bval(3,i,itemp)+(fis(itemp,ie)+bkg(3))*tem
-         bval(4,i,itemp)=bval(4,i,itemp)+(cap(itemp,ie)+bkg(4))*tem
+         bval(2,i,itemp)=bval(2,i,itemp)+(els(ie,itemp)+bkg(2))*tem
+         bval(3,i,itemp)=bval(3,i,itemp)+(fis(ie,itemp)+bkg(3))*tem
+         bval(4,i,itemp)=bval(4,i,itemp)+(cap(ie,itemp)+bkg(4))*tem
          bval(5,i,itemp)=bval(5,i,itemp)+tot*tem*tem
          bval(6,i,itemp)=bval(6,i,itemp)+tem
          bval(7,i,itemp)=bval(7,i,itemp)+tem*tem
@@ -2782,21 +2787,94 @@ contains
 
    subroutine fsort(x,n)
    !-------------------------------------------------------------------
-   ! Floating-point sort routine.
-   ! Sort x and y into increasing x order.
+   ! Floating-point sort routine (increasing order).
+   ! Monotone bucket distribution followed by insertion sort of small
+   ! buckets (quicksort for large buckets).  The sorted result is
+   ! unique, so it is identical to that of any other sort.
    !-------------------------------------------------------------------
    ! externals
-   integer::n,i
-   real(kr)::x(n),y(n)
+   integer::n
+   real(kr)::x(n)
    ! internals
-   integer::k,j
-   real(kr)::xt,yt
+   integer::i,j,b,lo,hi
+   real(kr)::xmin,xmax,scale,xt
+   integer,allocatable,save::cnt(:)
+   real(kr),allocatable,save::tmp(:)
 
    if (n <= 1) return
-   call quicksort(x,1,n)
-     
+   if (n <= 32) then
+      call isort(x,1,n)
+      return
+   endif
+   xmin=minval(x(1:n))
+   xmax=maxval(x(1:n))
+   if (xmax.le.xmin) return
+   scale=n/(xmax-xmin)
+   if (.not.(scale.lt.1.e300_kr)) then
+      call quicksort(x,1,n)
+      return
+   endif
+   if (allocated(tmp)) then
+      if (size(tmp).lt.n) deallocate(tmp,cnt)
+   endif
+   if (.not.allocated(tmp)) allocate(tmp(n),cnt(n+1))
+   cnt(1:n+1)=0
+   do i=1,n
+      b=int((x(i)-xmin)*scale)+1
+      if (b.gt.n) b=n
+      cnt(b+1)=cnt(b+1)+1
+   enddo
+   do b=2,n+1
+      cnt(b)=cnt(b)+cnt(b-1)
+   enddo
+   ! cnt(b) = number of elements in buckets < b
+   do i=1,n
+      b=int((x(i)-xmin)*scale)+1
+      if (b.gt.n) b=n
+      cnt(b)=cnt(b)+1
+      tmp(cnt(b))=x(i)
+   enddo
+   ! now cnt(b) = end of bucket b
+   lo=1
+   do b=1,n
+      hi=cnt(b)
+      if (hi-lo.gt.48) then
+         call quicksort(tmp,lo,hi)
+      else if (hi.gt.lo) then
+         do i=lo+1,hi
+            xt=tmp(i)
+            j=i-1
+            do while (j.ge.lo)
+               if (tmp(j).le.xt) exit
+               tmp(j+1)=tmp(j)
+               j=j-1
+            enddo
+            tmp(j+1)=xt
+         enddo
+      endif
+      lo=hi+1
+   enddo
+   x(1:n)=tmp(1:n)
    return
    end subroutine fsort
+
+   subroutine isort(a,l,r)
+   integer::l,r
+   real(kr)::a(*)
+   integer::i,j
+   real(kr)::xt
+   do i=l+1,r
+      xt=a(i)
+      j=i-1
+      do while (j.ge.l)
+         if (a(j).le.xt) exit
+         a(j+1)=a(j)
+         j=j-1
+      enddo
+      a(j+1)=xt
+   enddo
+   end subroutine isort
+
 
    recursive subroutine quicksort(a,l,r)
     real(kr), intent(inout) :: a(:)
@@ -2831,6 +2909,69 @@ contains
      if (l < j) call quicksort(a,l,j)
      if (i < r) call quicksort(a,i,r)
    end subroutine quicksort
+
+   subroutine mktsrch(es,n,btab,bemin,binvw)
+   !-------------------------------------------------------------------
+   ! Build a bucket index for the sorted array es(1:n) so that tsrch
+   ! can locate x in O(1) on average.  btab(b) = number of elements
+   ! whose bucket number is less than b (b=0,...,n).
+   !-------------------------------------------------------------------
+   integer::n
+   real(kr)::es(n),bemin,binvw
+   integer,allocatable::btab(:)
+   integer::i,b
+   real(kr)::w
+
+   if (allocated(btab)) then
+      if (size(btab).ne.n+1) deallocate(btab)
+   endif
+   if (.not.allocated(btab)) allocate(btab(0:n))
+   bemin=es(1)
+   w=es(n)-es(1)
+   binvw=0
+   if (w.gt.0) binvw=n/w
+   btab(0:n)=0
+   do i=1,n
+      b=int((es(i)-bemin)*binvw)
+      if (b.gt.n-1) b=n-1
+      btab(b+1)=btab(b+1)+1
+   enddo
+   do b=1,n
+      btab(b)=btab(b)+btab(b-1)
+   enddo
+   end subroutine mktsrch
+
+   subroutine tsrch(x,xarray,n,nfull,btab,bemin,binvw,i)
+   !-------------------------------------------------------------------
+   ! Same value of i as fsrch(x,xarray,n,i,k) for the sorted xarray,
+   ! (xarray(1:nfull) is the array indexed by btab, n.le.nfull and
+   ! all elements beyond n exceed x).
+   !-------------------------------------------------------------------
+   integer::n,nfull,i
+   integer::btab(0:nfull)
+   real(kr)::x,xarray(nfull),bemin,binvw
+   integer::r,b
+
+   if (x.lt.xarray(1)) then
+      i=1
+      return
+   endif
+   if (x.gt.xarray(n)) then
+      i=n
+      return
+   endif
+   b=int((x-bemin)*binvw)
+   if (b.gt.nfull-1) b=nfull-1
+   r=btab(b)
+   if (r.lt.1) r=1
+   do while (r.lt.n)
+      if (xarray(r+1).gt.x) exit
+      r=r+1
+   enddo
+   i=r
+   if (i.ge.n) i=n-1
+   return
+   end subroutine tsrch
 
    subroutine fsrch(x,xarray,n,i,k)
    !-------------------------------------------------------------------
