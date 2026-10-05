@@ -1,4 +1,5 @@
 module purm
+   !$ use omp_lib
    ! provides subroutine purr for NJOY2016
    use locale
    implicit none
@@ -55,6 +56,22 @@ module purm
 
    ! message flags
    integer::mflg1,mflg2
+
+   ! shared progress counters of the ladder worker loop
+   integer::ngen,nclaim,nacc
+   integer,dimension(:),allocatable::evdone
+   !$ integer(omp_lock_kind)::glock,alock
+
+   ! packed ladder storage and batch work arrays for the parallel
+   ! evaluation of ladders (see unrest)
+   type ladtyp
+      integer::n=0
+      integer,allocatable::nr(:),off(:)
+      real(kr),allocatable::p(:,:)
+   end type ladtyp
+   type(ladtyp),dimension(:),allocatable::lads
+   real(kr),dimension(:,:),allocatable::esb,fb
+   real(kr),dimension(:,:,:),allocatable::capb,fisb,elsb
 
 contains
 
@@ -665,6 +682,7 @@ contains
    if (allocated(heat)) deallocate(heat)
    if (allocated(c)) deallocate(c)
    if (allocated(d)) deallocate(d)
+   call lbatch_free()
 
    call atend(nout,0)
    call repoz(nout)
@@ -1815,6 +1833,8 @@ contains
    real(kr)::efact,cfact,ffact
    real(kr)::tot,tem,argt,arge,argf,argc,tnorm,enorm
    real(kr)::fnorm,cnorm,denom,den,ttt
+   integer::nth,nring
+   real(kr)::av(8)
    character(3),dimension(4),parameter::nmr=(/&
      'tot','els','fis','cap'/)
    character(60)::strng
@@ -1895,53 +1915,686 @@ contains
         &''capture'')') e,spot,dbart,sigx
    endif
 
-   !--loop over ladders
-   !--use first pass to set prob table limits
-   do 150 iladr=1,nladr
-   ne=nsamp
+   !--loop over ladders.
+   !--the random numbers are drawn serially in the original order
+   !--(energy grid, then one ladder per sequence, ladder by ladder).
+   !--the expensive cross section accumulation is done in parallel
+   !--for independent ladders, and the results are accumulated
+   !--serially in ladder order so the summation order and the output
+   !--are unchanged.  A ring of nring ladder slots bounds the memory.
+   !--Every thread runs the same worker loop (see ladworker): the
+   !--generation and accumulation stages are serial chains guarded by
+   !--locks, and the evaluation of the ladders is shared dynamically.
+   nth=1
+   !$ nth=omp_get_max_threads()
+   nring=max(1,min(nladr,4*nth))
+   call lbatch_alloc(nring,nsamp,ntemp,nseq0)
+   allocate(evdone(nladr))
+   evdone=0
+   ngen=0
+   nclaim=0
+   nacc=0
+   av=0
+   !$ call omp_init_lock(glock)
+   !$ call omp_init_lock(alock)
+   !$omp parallel default(shared)
+   call ladworker(nring,nsamp,ntemp,nsig0,nbin,emin,espan,elow,ehigh,&
+     er,gnr,gfr,ggr,gxr,gt,bkg,temp,sig0,tabl,tval,es,av)
+   !$omp end parallel
+   !$ call omp_destroy_lock(glock)
+   !$ call omp_destroy_lock(alock)
+   deallocate(evdone)
+   tav=av(1)
+   tvar=av(2)
+   eav=av(3)
+   evar=av(4)
+   fav=av(5)
+   fvar=av(6)
+   cav=av(7)
+   cvar=av(8)
 
-   !--choose random energy grid
-   do ie=1,ne
+   !--write overall average cross sections
+   tav=tav/nladr
+   argt=tvar/nladr-tav*tav
+   if (argt.lt.zero) argt=0
+   eav=eav/nladr
+   arge=evar/nladr-eav*eav
+   if (arge.lt.zero) arge=0
+   fav=fav/nladr
+   argf=fvar/nladr-fav*fav
+   if (argf.lt.zero) argf=0
+   cav=cav/nladr
+   argc=cvar/nladr-cav*cav
+   if (argc.lt.zero) argc=0
+   tvar=100*sqrt(argt)/tav
+   evar=100*sqrt(arge)/eav
+   if (fav.ne.zero) fvar=100*sqrt(argf)/fav
+   cvar=100*sqrt(argc)/cav
+   sigi(1)=sigi(2)+sigi(3)+sigi(4)+spot+bkg(1)
+   sigi(2)=sigi(2)+spot+bkg(2)
+   sigi(3)=sigi(3)+bkg(3)
+   sigi(4)=sigi(4)+bkg(4)
+   if (iprint.gt.0) write(nsyso,'(&
+     &''  bkgd'',1p,4e12.4/''  infd'',1p,4e12.4/&
+     &''  aver'',1p,4e12.4/''  pcsd'',0p,4f12.2/&
+     &''  nres'',i12)')&
+     (bkg(i),i=1,4),(sigi(i),i=1,4),&
+     tav,eav,fav,cav,tvar,evar,fvar,cvar,nrest
+
+   !--compute and write bondarenko table
+   if (iprint.gt.0) write(nsyso,'(/&
+     &'' bondarenko cross sections by direct sampling''/&
+     &9x,''temp'',6x,''sig0'',4x,''p0 total'',5x,&
+     &''elastic'',5x,''fission'',5x,''capture'',4x,&
+     &''p1 total'')')
+   do i=1,nsig0
+      do itemp=1,ntemp
+         sigf(1,i,itemp)=bval(1,i,itemp)/bval(6,i,itemp)
+         sigf(2,i,itemp)=bval(2,i,itemp)/bval(6,i,itemp)
+         sigf(3,i,itemp)=bval(3,i,itemp)/bval(6,i,itemp)
+         sigf(4,i,itemp)=bval(4,i,itemp)/bval(6,i,itemp)
+         sigf(5,i,itemp)=bval(5,i,itemp)/bval(7,i,itemp)
+      enddo
+   enddo
+   if (iprint.gt.0) then
+      do itemp=1,ntemp
+         do i=1,nsig0
+            write(nsyso,'(3x,1p,2e10.3,5e12.4)')&
+              temp(itemp),sig0(i),(sigf(j,i,itemp),j=1,5)
+         enddo
+      enddo
+   endif
+
+   !--normalize and write probability table
+   if (iprint.gt.0) write(nsyso,'(/'' probability table'')')
+   tnorm=sigi(1)-sigf(1,1,1)
+   enorm=sigi(2)-sigf(2,1,1)
+   fnorm=sigi(3)-sigf(3,1,1)
+   cnorm=sigi(4)-sigf(4,1,1)
+   tnorm=0
+   enorm=0
+   fnorm=0
+   cnorm=0
+   do i=1,nbin
+      do itemp=1,ntemp
+         tmin(itemp)=tmin(itemp)+tnorm
+         tval(nbin,itemp)=tmax(itemp)
+         denom=tabl(i,1,itemp)
+         if (denom.eq.zero) denom=1
+         tabl(i,1,itemp)=tabl(i,1,itemp)/tsum(itemp)
+         tabl(i,2,itemp)=tabl(i,2,itemp)/denom
+         tabl(i,3,itemp)=tabl(i,3,itemp)/denom
+         tabl(i,4,itemp)=tabl(i,4,itemp)/denom
+         tabl(i,5,itemp)=tabl(i,5,itemp)/denom
+         tabl(i,2,itemp)=tabl(i,2,itemp)-tnorm
+         tabl(i,3,itemp)=tabl(i,3,itemp)-enorm
+         tabl(i,4,itemp)=tabl(i,4,itemp)-fnorm
+         tabl(i,5,itemp)=tabl(i,5,itemp)-cnorm
+         if (tabl(i,1,itemp).le.zero) izeroprob=izeroprob+1
+         if (tabl(i,2,itemp).lt.zero) ibadxs=ibadxs+1
+         if (tabl(i,3,itemp).lt.zero) ibadxs=ibadxs+1
+         if (tabl(i,4,itemp).lt.zero) ibadxs=ibadxs+1
+         if (tabl(i,5,itemp).lt.zero) ibadxs=ibadxs+1
+      enddo
+   enddo
+   do itemp=1,ntemp
+      do ixx=1,4
+         if (ixx.eq.1) then
+            write(nsyso,'('' tmin'',1p,e11.3,1p,10e11.3)')&
+              temp(itemp),tmin(itemp)
+            write(nsyso,'('' tmax'',1p,e11.3,1p,10e11.3/(16x,10e11.3))')&
+              temp(itemp),(tval(i,itemp),i=1,nbin)
+            write(nsyso,'('' prob'',1p,e11.3,1p,10e11.3/(16x,10e11.3))')&
+              temp(itemp),(tabl(i,1,itemp),i=1,nbin)
+         endif
+         write(nsyso,'(1x,a,1x,1p,e11.3,10e11.3/(16x,10e11.3))')&
+           nmr(ixx),temp(itemp),(tabl(i,ixx+1,itemp),i=1,nbin)
+      enddo
+   enddo
+   if (izeroprob.gt.0) then
+      write(strng,'(''ptable has '',i3,'' zero probability bins'')') izeroprob
+      call mess('purr',strng,' ')
+   endif
+   if (ibadxs.gt.0) then
+      write(strng,'(''ptable has '',i3,'' negative xs values'')') ibadxs
+      call mess('purr',strng,' ')
+   endif
+
+   !--compute bondarenko cross sections from prob. table
+   if (iprint.gt.0) write(nsyso,'(/&
+     &'' bondarenko cross sections from probability table''/&
+     &9x,''temp'',6x,''sig0'',4x,''p0 total'',5x,''elastic'',&
+     &5x,''fission'',5x,''capture'',4x,''p1 total'')')
+   do i=1,nsig0
+      do j=1,7
+         do itemp=1,ntemp
+            bval(j,i,itemp)=0
+         enddo
+      enddo
+      do itemp=1,ntemp
+         do j=1,nbin
+            if (tabl(j,1,itemp).ne.zero) then
+               den=sig0(i)/(sig0(i)+tabl(j,2,itemp))
+               ttt=tabl(j,1,itemp)
+               bval(1,i,itemp)=bval(1,i,itemp)+ttt*tabl(j,2,itemp)*den
+               bval(2,i,itemp)=bval(2,i,itemp)+ttt*tabl(j,3,itemp)*den
+               bval(3,i,itemp)=bval(3,i,itemp)+ttt*tabl(j,4,itemp)*den
+               bval(4,i,itemp)=bval(4,i,itemp)+ttt*tabl(j,5,itemp)*den
+               bval(5,i,itemp)=bval(5,i,itemp)+ttt*tabl(j,2,itemp)*den*den
+               bval(6,i,itemp)=bval(6,i,itemp)+ttt*den
+               bval(7,i,itemp)=bval(7,i,itemp)+ttt*den*den
+            endif
+         enddo
+         sigf(1,i,itemp)=bval(1,i,itemp)/bval(6,i,itemp)
+         sigf(2,i,itemp)=bval(2,i,itemp)/bval(6,i,itemp)
+         sigf(3,i,itemp)=bval(3,i,itemp)/bval(6,i,itemp)
+         sigf(4,i,itemp)=bval(4,i,itemp)/bval(6,i,itemp)
+         sigf(5,i,itemp)=bval(5,i,itemp)/bval(7,i,itemp)
+      enddo
+   enddo
+   if (iprint.gt.0) then
+      do itemp=1,ntemp
+         do i=1,nsig0
+            write(nsyso,'(3x,1p,2e10.3,5e12.4)')&
+              temp(itemp),sig0(i),(sigf(j,i,itemp),j=1,5)
+         enddo
+      enddo
+   endif
+
+   !--renormalize probability table and bondarenko
+   !--cross sections to the computed infinitely-dilute values
+   do itemp=1,ntemp
+      do i=2,5
+         do j=1,nbin
+            l=4*(itemp-1)
+            if (sigf(i-1,1,itemp).ne.0)&
+              tabl(j,i,itemp)=tabl(j,i,itemp)*sigi(i-1)/sigf(i-1,1,itemp)
+         enddo
+      enddo
+   enddo
+   do itemp=1,ntemp
+      do i=nsig0,1,-1
+         do j=1,5
+            k=j
+            if (j.eq.5) k=1
+            if (sigf(j,1,itemp).ne.0)&
+              sigf(j,i,itemp)=sigf(j,i,itemp)*sigi(k)/sigf(j,1,itemp)
+            sigpl(ipl,j,i)=sigf(j,i,1)
+         enddo
+      enddo
+   enddo
+     !optional printout for plotting probability per barn with viewr
+     !uncomment the following lines to activate
+     !write(nsyso,'(/'' probability per barn versus total'')')
+     !write(nsyso,'('' e='',1p,e12.4)') e
+     !tnorm=0
+     !do i=1,nbin
+     !   denom=tval(i,1)-tnorm
+     !   denom=tabl(i,1,1)/denom
+     !   write(nsyso,'(1p,2e11.4,''/'')') tabl(i,2,1),denom
+     !   tnorm=tval(i,1)
+     !enddo
+   return
+   end subroutine unrest
+
+   subroutine ladworker(nring,nsamp,ntemp,nsig0,nbin,emin,espan,elow,&
+     ehigh,er,gnr,gfr,ggr,gxr,gt,bkg,temp,sig0,tabl,tval,es,av)
+   !-------------------------------------------------------------------
+   ! Worker loop executed by every thread of the team (or by the one
+   ! and only thread when OpenMP is not used).  Three stages:
+   !   generate   serial chain (lock glock): draws the random numbers of
+   !              ladder ngen+1 in the original order, if a ring slot is
+   !              free;
+   !   evaluate   any thread claims the next generated ladder and
+   !              computes its cross sections (independent work);
+   !   accumulate serial chain (lock alock): adds the evaluated ladders
+   !              to the sums strictly in ladder order.
+   ! Progress counters are shared and accessed atomically; the locks
+   ! are only tried when the stage has something to do.
+   !-------------------------------------------------------------------
+   integer::nring,nsamp,ntemp,nsig0,nbin
+   real(kr)::emin,espan,elow,ehigh
+   real(kr)::er(*),gnr(*),gfr(*),ggr(*),gxr(*),gt(*)
+   real(kr)::bkg(4),temp(ntemp),sig0(nsig0),av(8)
+   real(kr)::tabl(nbin,5,ntemp),tval(nbin,ntemp),es(nsamp)
+   logical::got
+   integer::g,sl,na,ng,nc,ev
+   do
+      !$omp atomic read seq_cst
+      na=nacc
+      if (na.ge.nladr) exit
+
+      !--accumulate whatever is ready, in ladder order
+      ev=0
+      if (na.lt.nladr) then
+         !$omp atomic read seq_cst
+         ev=evdone(na+1)
+      endif
+      if (ev.ne.0) then
+         got=.true.
+         !$ got=omp_test_lock(alock)
+         if (got) then
+            do
+               g=nacc+1
+               if (g.gt.nladr) exit
+               !$omp atomic read seq_cst
+               ev=evdone(g)
+               if (ev.eq.0) exit
+               sl=mod(g-1,nring)+1
+               call ladacc(sl,g,av,bkg,sig0,tabl,tval,es,nsig0,ntemp,&
+                 nbin,nsamp)
+               !$omp atomic write seq_cst
+               nacc=g
+            enddo
+            !$ call omp_unset_lock(alock)
+         endif
+      endif
+
+      !--generate the next ladder if a slot is free
+      !$omp atomic read seq_cst
+      ng=ngen
+      !$omp atomic read seq_cst
+      na=nacc
+      if (ng.lt.nladr.and.ng+1-na.le.nring) then
+         got=.true.
+         !$ got=omp_test_lock(glock)
+         if (got) then
+            g=ngen+1
+            !$omp atomic read seq_cst
+            na=nacc
+            if (g.le.nladr.and.g-na.le.nring) then
+               sl=mod(g-1,nring)+1
+               call ladgen(sl,nsamp,emin,espan,elow,ehigh,er,gnr,gfr,ggr,&
+                 gxr,gt)
+               !$omp atomic write seq_cst
+               ngen=g
+            endif
+            !$ call omp_unset_lock(glock)
+         endif
+      endif
+
+      !--claim and evaluate a generated ladder
+      g=0
+      !$omp atomic read seq_cst
+      ng=ngen
+      !$omp atomic read seq_cst
+      nc=nclaim
+      if (nc.lt.ng) then
+         !$omp critical(ladclaim)
+         if (nclaim.lt.ngen) then
+            g=nclaim+1
+            !$omp atomic write seq_cst
+            nclaim=g
+         endif
+         !$omp end critical(ladclaim)
+      endif
+      if (g.gt.0) then
+         sl=mod(g-1,nring)+1
+         call ladwork(sl,nsamp,ntemp,bkg,temp)
+         !$omp atomic write seq_cst
+         evdone(g)=1
+      endif
+   enddo
+   return
+   end subroutine ladworker
+
+   subroutine ladgen(sl,nsamp,emin,espan,elow,ehigh,er,gnr,gfr,ggr,gxr,gt)
+   !-------------------------------------------------------------------
+   ! Serial stage: draw the random inputs for one ladder into slot sl,
+   ! consuming the random number stream in exactly the original order.
+   !-------------------------------------------------------------------
+   integer::sl,nsamp
+   real(kr)::emin,espan,elow,ehigh
+   real(kr)::er(*),gnr(*),gfr(*),ggr(*),gxr(*),gt(*)
+   integer::ie,k,nr
+   do ie=1,nsamp
       rr=rann(kk)
-      es(ie)=emin+espan*rr
+      esb(ie,sl)=emin+espan*rr
+   enddo
+   lads(sl)%n=0
+   do k=1,nseq0
+      call ladr2(k,elow,ehigh,nr,er,gnr,gfr,ggr,gxr,gt)
+      call ladpack(lads(sl),k,nr,er,gnr,gfr,ggr,gxr,gt)
+   enddo
+   return
+   end subroutine ladgen
+
+   subroutine ladwork(sl,ne,ntemp,bkg,temp)
+   !-------------------------------------------------------------------
+   ! Parallel stage: everything for one ladder that does not depend on
+   ! other ladders (sort, cross sections, per-ladder averages).
+   ! Touches only slot sl.
+   !-------------------------------------------------------------------
+   integer::sl,ne,ntemp
+   real(kr)::bkg(4),temp(ntemp)
+   integer::ie,itemp
+   real(kr)::totf,elsf,capf,fisf,efact,cfact,ffact
+   real(kr),dimension(:),allocatable::xsl
+   real(kr),parameter::big=1.e6_kr
+   real(kr),parameter::zero=0
+   allocate(xsl(ne))
+   call fsort(esb(1,sl),ne)
+   call ladeval(lads(sl),nseq0,esb(1,sl),ne,xsl,temp,ntemp,&
+     capb(1,1,sl),fisb(1,1,sl),elsb(1,1,sl))
+   deallocate(xsl)
+
+   !--eliminate negative elastic cross sections; reset to 1 microbarn
+   do ie=1,ne
+      do itemp=1,ntemp
+         if (elsb(itemp,ie,sl).lt.-bkg(2)) elsb(itemp,ie,sl)=-bkg(2)+1/big
+      enddo
+   enddo
+
+   !--compute infinitely-dilute cross sections
+   totf=0
+   elsf=0
+   capf=0
+   fisf=0
+   do ie=1,ne
+      totf=totf+elsb(1,ie,sl)+fisb(1,ie,sl)+capb(1,ie,sl)+bkg(1)
+      elsf=elsf+elsb(1,ie,sl)+bkg(2)
+      capf=capf+capb(1,ie,sl)+bkg(4)
+      fisf=fisf+fisb(1,ie,sl)+bkg(3)
+   enddo
+   totf=totf/ne
+   elsf=elsf/ne
+   capf=capf/ne
+   fisf=fisf/ne
+   fb(1,sl)=totf
+   fb(2,sl)=elsf
+   fb(3,sl)=fisf
+   fb(4,sl)=capf
+
+   !--renormalize reaction cross sections
+   if (nmode.eq.1) then
+      efact=(sigi(2)+bkg(2))/(elsf-spot)
+      cfact=(sigi(4)+bkg(4))/capf
+      ffact=1
+      if (fisf.ne.zero) ffact=(sigi(3)+bkg(3))/fisf
+      do ie=1,ne
+         do itemp=1,ntemp
+            elsb(itemp,ie,sl)=spot+(elsb(itemp,ie,sl)-spot)*efact
+            capb(itemp,ie,sl)=capb(itemp,ie,sl)*cfact
+            fisb(itemp,ie,sl)=fisb(itemp,ie,sl)*ffact
+         enddo
+      enddo
+   endif
+   return
+   end subroutine ladwork
+
+   subroutine ladacc(sl,iladr,av,bkg,sig0,tabl,tval,es,nsig0,ntemp,nbin,nsamp)
+   !-------------------------------------------------------------------
+   ! Serial stage, executed in ladder order: accumulate the results of
+   ! ladder iladr (slot sl) into the averages, probability table and
+   ! bondarenko sums.
+   !-------------------------------------------------------------------
+   use mainio ! provides nsysi,nsyso
+   use util ! provides mess
+   integer::sl,iladr,nsig0,ntemp,nbin,nsamp
+   real(kr)::av(8),bkg(4),sig0(nsig0)
+   real(kr)::tabl(nbin,5,ntemp),tval(nbin,ntemp),es(nsamp)
+   integer::ne,itemp,ie,i,j,nebin,ibin,ii,mfl
+   real(kr)::totf,elsf,capf,fisf,tot,tem
+   character(60)::strng
+   real(kr),parameter::big=1.e6_kr
+   ne=nsamp
+   if (iladr.eq.1) av=0
+   totf=fb(1,sl)
+   elsf=fb(2,sl)
+   fisf=fb(3,sl)
+   capf=fb(4,sl)
+   av(1)=av(1)+totf
+   av(2)=av(2)+totf*totf
+   av(3)=av(3)+elsf
+   av(4)=av(4)+elsf*elsf
+   av(5)=av(5)+fisf
+   av(6)=av(6)+fisf*fisf
+   av(7)=av(7)+capf
+   av(8)=av(8)+capf*capf
+   if (iprint.gt.0) write(nsyso,'(i6,1p,4e12.4)')&
+     iladr,totf,elsf,fisf,capf
+
+   !--loop over temperatures
+   !--using a different total cross section bin structure for each
+   do 140 itemp=1,ntemp
+
+   !--choose probability table bounds
+   !--and zero accumulators
+   if (iladr.eq.1) then
+      do ie=1,ne
+         es(ie)=elsb(itemp,ie,sl)+fisb(itemp,ie,sl)+capb(itemp,ie,sl)+bkg(1)
+      enddo
+      call fsort(es,ne)
+      tmin(itemp)=es(1)
+      tmax(itemp)=es(ne)
+      nebin=int(nsamp/(nbin-10+1.76))
+      ibin=nebin/200
+      if (ibin.le.0) then
+         if (mflg1.eq.0) then
+            mflg1=1
+            write(strng,'(''reset ibin=1, consider larger nsamp'',&
+                         &'' or smaller nbin'')')
+            call mess('purr',strng,'')
+         endif
+         ibin=1
+      endif
+      do i=1,nbin-1
+         if (ibin.gt.nsamp) then
+            if (mflg2.eq.0) then
+               mflg2=1
+               write(strng,'(''reset ibin=nsamp,'',&
+                            &'' consider smaller nbin'')')
+               call mess('purr',strng,'')
+            endif
+            ibin=nsamp
+         endif
+         tval(i,itemp)=es(ibin)
+         if (i.gt.1) then
+            if (tval(i,itemp).le.tval(i-1,itemp))&
+              tval(i,itemp)=tval(i-1,itemp)+tval(i-1,itemp)/20
+         endif
+         if (i.eq.1) ibin=ibin+nebin/40
+         if (i.eq.2) ibin=ibin+nebin/10
+         if (i.eq.3) ibin=ibin+nebin/4
+         if (i.eq.4) ibin=ibin+nebin/2
+         if (i.gt.4.and.i.lt.nbin-5) ibin=ibin+nebin
+         if (i.eq.nbin-5) ibin=ibin+nebin/2
+         if (i.eq.nbin-4) ibin=ibin+nebin/4
+         if (i.eq.nbin-3) ibin=ibin+nebin/10
+         if (i.eq.nbin-2) ibin=ibin+nebin/40
+         if (i.eq.nbin-1) ibin=ibin+nebin/200
+      enddo
+      tval(nbin,itemp)=big
+      do i=1,nbin
+         do j=1,5
+            tabl(i,j,itemp)=0
+         enddo
+      enddo
+      tsum(itemp)=0
+   endif
+
+   !--accumulate cross sections into tables
+   do ie=1,ne
+      tot=elsb(itemp,ie,sl)+fisb(itemp,ie,sl)+capb(itemp,ie,sl)+bkg(1)
+      if (tot.lt.tmin(itemp)) tmin(itemp)=tot
+      if (tot.gt.tmax(itemp)) tmax(itemp)=tot
+      call fsrch(tot,tval(1,itemp),nbin,ii,mfl)
+      if (mfl.ne.2.and.ii.lt.nbin) ii=ii+1
+      if (ii.lt.1) ii=1
+      tsum(itemp)=tsum(itemp)+1
+      tabl(ii,1,itemp)=tabl(ii,1,itemp)+1
+      tabl(ii,2,itemp)=tabl(ii,2,itemp)+tot
+      tabl(ii,3,itemp)=tabl(ii,3,itemp)+elsb(itemp,ie,sl)+bkg(2)
+      tabl(ii,4,itemp)=tabl(ii,4,itemp)+fisb(itemp,ie,sl)+bkg(3)
+      tabl(ii,5,itemp)=tabl(ii,5,itemp)+capb(itemp,ie,sl)+bkg(4)
+      do i=1,nsig0
+         tem=sig0(i)/(sig0(i)+tot)
+         bval(1,i,itemp)=bval(1,i,itemp)+tot*tem
+         bval(2,i,itemp)=bval(2,i,itemp)+(elsb(itemp,ie,sl)+bkg(2))*tem
+         bval(3,i,itemp)=bval(3,i,itemp)+(fisb(itemp,ie,sl)+bkg(3))*tem
+         bval(4,i,itemp)=bval(4,i,itemp)+(capb(itemp,ie,sl)+bkg(4))*tem
+         bval(5,i,itemp)=bval(5,i,itemp)+tot*tem*tem
+         bval(6,i,itemp)=bval(6,i,itemp)+tem
+         bval(7,i,itemp)=bval(7,i,itemp)+tem*tem
+      enddo
+   enddo
+
+   !--close loop over temperatures
+  140 continue
+   return
+   end subroutine ladacc
+
+   subroutine lbatch_alloc(nbat,nsamp,ntemp,nseq)
+   !-------------------------------------------------------------------
+   ! (Re)allocate the batch storage used by unrest.
+   !-------------------------------------------------------------------
+   integer::nbat,nsamp,ntemp,nseq
+   integer::ib
+   logical::ok
+   ok=allocated(lads)
+   if (ok) then
+      ok=(size(lads).eq.nbat).and.(size(esb,1).eq.nsamp)&
+        .and.(size(capb,1).eq.ntemp)
+   endif
+   if (.not.ok) then
+      call lbatch_free()
+      allocate(lads(nbat))
+      allocate(esb(nsamp,nbat))
+      allocate(capb(ntemp,nsamp,nbat))
+      allocate(fisb(ntemp,nsamp,nbat))
+      allocate(elsb(ntemp,nsamp,nbat))
+      allocate(fb(4,nbat))
+   endif
+   do ib=1,nbat
+      if (allocated(lads(ib)%nr)) then
+         if (size(lads(ib)%nr).ne.nseq) then
+            deallocate(lads(ib)%nr)
+            deallocate(lads(ib)%off)
+         endif
+      endif
+      if (.not.allocated(lads(ib)%nr)) then
+         allocate(lads(ib)%nr(nseq))
+         allocate(lads(ib)%off(nseq))
+      endif
+      if (.not.allocated(lads(ib)%p)) allocate(lads(ib)%p(6,4096))
+   enddo
+   return
+   end subroutine lbatch_alloc
+
+   subroutine lbatch_free()
+   if (allocated(lads)) deallocate(lads)
+   if (allocated(esb)) deallocate(esb)
+   if (allocated(capb)) deallocate(capb)
+   if (allocated(fisb)) deallocate(fisb)
+   if (allocated(elsb)) deallocate(elsb)
+   if (allocated(fb)) deallocate(fb)
+   return
+   end subroutine lbatch_free
+
+   subroutine ladpack(lad,k,nr,er,gnr,gfr,ggr,gxr,gt)
+   !-------------------------------------------------------------------
+   ! Append the ladder of sequence k to the packed storage of lad.
+   !-------------------------------------------------------------------
+   type(ladtyp)::lad
+   integer::k,nr
+   real(kr)::er(*),gnr(*),gfr(*),ggr(*),gxr(*),gt(*)
+   real(kr),dimension(:,:),allocatable::tmp
+   integer::jr,nn
+   nn=lad%n+nr
+   if (nn.gt.size(lad%p,2)) then
+      allocate(tmp(6,2*nn))
+      tmp(:,1:lad%n)=lad%p(:,1:lad%n)
+      call move_alloc(tmp,lad%p)
+   endif
+   lad%off(k)=lad%n
+   lad%nr(k)=nr
+   do jr=1,nr
+      lad%p(1,lad%n+jr)=er(jr)
+      lad%p(2,lad%n+jr)=gnr(jr)
+      lad%p(3,lad%n+jr)=gfr(jr)
+      lad%p(4,lad%n+jr)=ggr(jr)
+      lad%p(5,lad%n+jr)=gxr(jr)
+      lad%p(6,lad%n+jr)=gt(jr)
+   enddo
+   lad%n=nn
+   return
+   end subroutine ladpack
+
+   subroutine ladeval(lad,nseqz,es,ne,xs,temp,ntemp,cap,fis,els)
+   !-------------------------------------------------------------------
+   ! Thread-safe accumulation of the cross sections for one ladder
+   ! (all sequences, all temperatures) on the sorted energy grid es.
+   ! Reads only module constants; writes only its arguments.
+   !-------------------------------------------------------------------
+   use physics ! provides pi
+   ! externals
+   type(ladtyp),intent(in)::lad
+   integer::nseqz,ne,ntemp
+   real(kr)::es(ne),xs(ne),temp(ntemp)
+   real(kr)::cap(ntemp,ne),fis(ntemp,ne),els(ntemp,ne)
+   ! internals
+   integer::nr,itemp,k,jr,o,ie,mfl
+   integer::i7,i0,it,i6,i1,i5,i2,is,i4,i3,jj,j,n,ii,i
+   real(kr)::rpi,ctx,chek1,chek2,chekn,delr,elo,ehi
+   real(kr)::y,yy,szy,cc2,cs2,ccg,ccf,test,x,a1,rew,aimw
+   real(kr)::a2,a3,temp1,temp2,a4,a5,f1,f2,a6,e1,e2,e3
+   real(kr)::tempor,q,q2,hq,hq2,ax,aki,p,p2,hp,hp2,pq
+   real(kr),parameter::c1=0.5641895835e0_kr
+   real(kr),parameter::c2=0.2752551e0_kr
+   real(kr),parameter::c3=2.724745e0_kr
+   real(kr),parameter::c4=0.5124242e0_kr
+   real(kr),parameter::c5=0.05176536e0_kr
+   real(kr),parameter::half=0.5e0_kr
+   real(kr),parameter::ten=10.0e0_kr
+   real(kr),parameter::d1=0.4613135e0_kr
+   real(kr),parameter::d2=0.1901635e0_kr
+   real(kr),parameter::d3=0.09999216e0_kr
+   real(kr),parameter::d4=1.7844927e0_kr
+   real(kr),parameter::d5=0.002883894e0_kr
+   real(kr),parameter::d6=5.5253437e0_kr
+   real(kr),parameter::fifty=50
+   real(kr),parameter::con1=31.83e0_kr
+   real(kr),parameter::con2=20.e0_kr
+   real(kr),parameter::break1=.5e0_kr
+   real(kr),parameter::break2=3.9e0_kr
+   real(kr),parameter::tref=300.e0_kr
+   real(kr),parameter::zero=0
+   rpi=sqrt(pi)
+   do ie=1,ne
       do itemp=1,ntemp
          cap(itemp,ie)=0
          fis(itemp,ie)=0
          els(itemp,ie)=spot
       enddo
    enddo
-   call fsort(es,ne)
-
-   !--loop over sequences
-   do 170 k=1,nseq0
-   call ladr2(k,elow,ehigh,nr,er,gnr,gfr,ggr,gxr,gt)
-
-   !--loop over temperatures
+   do 170 k=1,nseqz
+   nr=lad%nr(k)
+   o=lad%off(k)
    do 180 itemp=1,ntemp
    ctx=cth(k)*sqrt(tref/temp(itemp))
 
    !--accumulate contributions to cross sections
    do 210 jr=1,nr
-   chek1=con1*gt(jr)
+   chek1=con1*lad%p(6,o+jr)
    chek2=con2/ctx
    chekn=chek1
    if (chek2.gt.chek1) chekn=chek2
    delr=chek1+chekn
-   elo=er(jr)-delr
-   ehi=er(jr)+delr
+   elo=lad%p(1,o+jr)-delr
+   ehi=lad%p(1,o+jr)+delr
    call fsrch(ehi,es,ne,i7,mfl)
    call fsrch(elo,es,i7,i0,mfl)
    if (i0.eq.i7) go to 210
    it=i7-i0+1
-   y=ctx*gt(jr)/2
+   y=ctx*lad%p(6,o+jr)/2
    yy=y*y
-   szy=csz(k)*gnr(jr)*rpi*y
-   cc2=szy*(cc2p(k)-1+gnr(jr))
+   szy=csz(k)*lad%p(2,o+jr)*rpi*y
+   cc2=szy*(cc2p(k)-1+lad%p(2,o+jr))
    cs2=szy*cs2p(k)
-   ccg=szy*ggr(jr)
-   ccf=szy*gfr(jr)
+   ccg=szy*lad%p(4,o+jr)
+   ccf=szy*lad%p(3,o+jr)
    do ie=i0,i7
-      xs(ie)=ctx*(es(ie)-er(jr))
+      xs(ie)=ctx*(es(ie)-lad%p(1,o+jr))
    enddo
 
    !--accumulate cross sections using an
@@ -2207,340 +2860,8 @@ contains
   210 continue
   180 continue
   170 continue
-
-   !--eliminate negative elastic cross sections; reset to 1 microbarn
-   do itemp=1,ntemp
-      do ie=1,ne
-         if (els(itemp,ie).lt.-bkg(2)) els(itemp,ie)=-bkg(2)+1/big
-      enddo
-   enddo
-
-   !--compute infinitely-dilute cross sections
-   if (iladr.eq.1) then
-      tav=0
-      tvar=0
-      eav=0
-      evar=0
-      fav=0
-      fvar=0
-      cav=0
-      cvar=0
-   endif
-   totf=0
-   elsf=0
-   capf=0
-   fisf=0
-   do ie=1,ne
-      totf=totf+els(1,ie)+fis(1,ie)+cap(1,ie)+bkg(1)
-      elsf=elsf+els(1,ie)+bkg(2)
-      capf=capf+cap(1,ie)+bkg(4)
-      fisf=fisf+fis(1,ie)+bkg(3)
-   enddo
-   totf=totf/ne
-   elsf=elsf/ne
-   capf=capf/ne
-   fisf=fisf/ne
-   tav=tav+totf
-   tvar=tvar+totf*totf
-   eav=eav+elsf
-   evar=evar+elsf*elsf
-   fav=fav+fisf
-   fvar=fvar+fisf*fisf
-   cav=cav+capf
-   cvar=cvar+capf*capf
-   if (iprint.gt.0) write(nsyso,'(i6,1p,4e12.4)')&
-     iladr,totf,elsf,fisf,capf
-
-   !--renormalize reaction cross sections
-   !--compute total cross section
-   if (nmode.eq.1) then
-      efact=(sigi(2)+bkg(2))/(elsf-spot)
-      cfact=(sigi(4)+bkg(4))/capf
-      ffact=1
-      if (fisf.ne.zero) ffact=(sigi(3)+bkg(3))/fisf
-      do ie=1,ne
-         do itemp=1,ntemp
-            els(itemp,ie)=spot+(els(itemp,ie)-spot)*efact
-            cap(itemp,ie)=cap(itemp,ie)*cfact
-            fis(itemp,ie)=fis(itemp,ie)*ffact
-         enddo
-      enddo
-   endif
-
-   !--loop over temperatures
-   !--using a different total cross section bin structure for each
-   do 140 itemp=1,ntemp
-
-   !--choose probability table bounds
-   !--and zero accumulators
-   if (iladr.eq.1) then
-      do ie=1,ne
-         es(ie)=els(itemp,ie)+fis(itemp,ie)+cap(itemp,ie)+bkg(1)
-      enddo
-      call fsort(es,ne)
-      tmin(itemp)=es(1)
-      tmax(itemp)=es(ne)
-      nebin=int(nsamp/(nbin-10+1.76))
-      ibin=nebin/200
-      if (ibin.le.0) then
-         if (mflg1.eq.0) then
-            mflg1=1
-            write(strng,'(''reset ibin=1, consider larger nsamp'',&
-                         &'' or smaller nbin'')')
-            call mess('purr',strng,'')
-         endif
-         ibin=1
-      endif
-      do i=1,nbin-1
-         if (ibin.gt.nsamp) then
-            if (mflg2.eq.0) then
-               mflg2=1
-               write(strng,'(''reset ibin=nsamp,'',&
-                            &'' consider smaller nbin'')')
-               call mess('purr',strng,'')
-            endif
-            ibin=nsamp
-         endif
-         tval(i,itemp)=es(ibin)
-         if (i.gt.1) then
-            if (tval(i,itemp).le.tval(i-1,itemp))&
-              tval(i,itemp)=tval(i-1,itemp)+tval(i-1,itemp)/20
-         endif
-         if (i.eq.1) ibin=ibin+nebin/40
-         if (i.eq.2) ibin=ibin+nebin/10
-         if (i.eq.3) ibin=ibin+nebin/4
-         if (i.eq.4) ibin=ibin+nebin/2
-         if (i.gt.4.and.i.lt.nbin-5) ibin=ibin+nebin
-         if (i.eq.nbin-5) ibin=ibin+nebin/2
-         if (i.eq.nbin-4) ibin=ibin+nebin/4
-         if (i.eq.nbin-3) ibin=ibin+nebin/10
-         if (i.eq.nbin-2) ibin=ibin+nebin/40
-         if (i.eq.nbin-1) ibin=ibin+nebin/200
-      enddo
-      tval(nbin,itemp)=big
-      do i=1,nbin
-         do j=1,5
-            tabl(i,j,itemp)=0
-         enddo
-      enddo
-      tsum(itemp)=0
-   endif
-
-   !--accumulate cross sections into tables
-   do ie=1,ne
-      tot=els(itemp,ie)+fis(itemp,ie)+cap(itemp,ie)+bkg(1)
-      if (tot.lt.tmin(itemp)) tmin(itemp)=tot
-      if (tot.gt.tmax(itemp)) tmax(itemp)=tot
-      call fsrch(tot,tval(1,itemp),nbin,ii,mfl)
-      if (mfl.ne.2.and.ii.lt.nbin) ii=ii+1
-      if (ii.lt.1) ii=1
-      tsum(itemp)=tsum(itemp)+1
-      tabl(ii,1,itemp)=tabl(ii,1,itemp)+1
-      tabl(ii,2,itemp)=tabl(ii,2,itemp)+tot
-      tabl(ii,3,itemp)=tabl(ii,3,itemp)+els(itemp,ie)+bkg(2)
-      tabl(ii,4,itemp)=tabl(ii,4,itemp)+fis(itemp,ie)+bkg(3)
-      tabl(ii,5,itemp)=tabl(ii,5,itemp)+cap(itemp,ie)+bkg(4)
-      do i=1,nsig0
-         tem=sig0(i)/(sig0(i)+tot)
-         bval(1,i,itemp)=bval(1,i,itemp)+tot*tem
-         bval(2,i,itemp)=bval(2,i,itemp)+(els(itemp,ie)+bkg(2))*tem
-         bval(3,i,itemp)=bval(3,i,itemp)+(fis(itemp,ie)+bkg(3))*tem
-         bval(4,i,itemp)=bval(4,i,itemp)+(cap(itemp,ie)+bkg(4))*tem
-         bval(5,i,itemp)=bval(5,i,itemp)+tot*tem*tem
-         bval(6,i,itemp)=bval(6,i,itemp)+tem
-         bval(7,i,itemp)=bval(7,i,itemp)+tem*tem
-      enddo
-   enddo
-
-   !--close loop over temperatures
-  140 continue
-
-   !--close loop over ladders
-  150 continue
-
-   !--write overall average cross sections
-   tav=tav/nladr
-   argt=tvar/nladr-tav*tav
-   if (argt.lt.zero) argt=0
-   eav=eav/nladr
-   arge=evar/nladr-eav*eav
-   if (arge.lt.zero) arge=0
-   fav=fav/nladr
-   argf=fvar/nladr-fav*fav
-   if (argf.lt.zero) argf=0
-   cav=cav/nladr
-   argc=cvar/nladr-cav*cav
-   if (argc.lt.zero) argc=0
-   tvar=100*sqrt(argt)/tav
-   evar=100*sqrt(arge)/eav
-   if (fav.ne.zero) fvar=100*sqrt(argf)/fav
-   cvar=100*sqrt(argc)/cav
-   sigi(1)=sigi(2)+sigi(3)+sigi(4)+spot+bkg(1)
-   sigi(2)=sigi(2)+spot+bkg(2)
-   sigi(3)=sigi(3)+bkg(3)
-   sigi(4)=sigi(4)+bkg(4)
-   if (iprint.gt.0) write(nsyso,'(&
-     &''  bkgd'',1p,4e12.4/''  infd'',1p,4e12.4/&
-     &''  aver'',1p,4e12.4/''  pcsd'',0p,4f12.2/&
-     &''  nres'',i12)')&
-     (bkg(i),i=1,4),(sigi(i),i=1,4),&
-     tav,eav,fav,cav,tvar,evar,fvar,cvar,nrest
-
-   !--compute and write bondarenko table
-   if (iprint.gt.0) write(nsyso,'(/&
-     &'' bondarenko cross sections by direct sampling''/&
-     &9x,''temp'',6x,''sig0'',4x,''p0 total'',5x,&
-     &''elastic'',5x,''fission'',5x,''capture'',4x,&
-     &''p1 total'')')
-   do i=1,nsig0
-      do itemp=1,ntemp
-         sigf(1,i,itemp)=bval(1,i,itemp)/bval(6,i,itemp)
-         sigf(2,i,itemp)=bval(2,i,itemp)/bval(6,i,itemp)
-         sigf(3,i,itemp)=bval(3,i,itemp)/bval(6,i,itemp)
-         sigf(4,i,itemp)=bval(4,i,itemp)/bval(6,i,itemp)
-         sigf(5,i,itemp)=bval(5,i,itemp)/bval(7,i,itemp)
-      enddo
-   enddo
-   if (iprint.gt.0) then
-      do itemp=1,ntemp
-         do i=1,nsig0
-            write(nsyso,'(3x,1p,2e10.3,5e12.4)')&
-              temp(itemp),sig0(i),(sigf(j,i,itemp),j=1,5)
-         enddo
-      enddo
-   endif
-
-   !--normalize and write probability table
-   if (iprint.gt.0) write(nsyso,'(/'' probability table'')')
-   tnorm=sigi(1)-sigf(1,1,1)
-   enorm=sigi(2)-sigf(2,1,1)
-   fnorm=sigi(3)-sigf(3,1,1)
-   cnorm=sigi(4)-sigf(4,1,1)
-   tnorm=0
-   enorm=0
-   fnorm=0
-   cnorm=0
-   do i=1,nbin
-      do itemp=1,ntemp
-         tmin(itemp)=tmin(itemp)+tnorm
-         tval(nbin,itemp)=tmax(itemp)
-         denom=tabl(i,1,itemp)
-         if (denom.eq.zero) denom=1
-         tabl(i,1,itemp)=tabl(i,1,itemp)/tsum(itemp)
-         tabl(i,2,itemp)=tabl(i,2,itemp)/denom
-         tabl(i,3,itemp)=tabl(i,3,itemp)/denom
-         tabl(i,4,itemp)=tabl(i,4,itemp)/denom
-         tabl(i,5,itemp)=tabl(i,5,itemp)/denom
-         tabl(i,2,itemp)=tabl(i,2,itemp)-tnorm
-         tabl(i,3,itemp)=tabl(i,3,itemp)-enorm
-         tabl(i,4,itemp)=tabl(i,4,itemp)-fnorm
-         tabl(i,5,itemp)=tabl(i,5,itemp)-cnorm
-         if (tabl(i,1,itemp).le.zero) izeroprob=izeroprob+1
-         if (tabl(i,2,itemp).lt.zero) ibadxs=ibadxs+1
-         if (tabl(i,3,itemp).lt.zero) ibadxs=ibadxs+1
-         if (tabl(i,4,itemp).lt.zero) ibadxs=ibadxs+1
-         if (tabl(i,5,itemp).lt.zero) ibadxs=ibadxs+1
-      enddo
-   enddo
-   do itemp=1,ntemp
-      do ixx=1,4
-         if (ixx.eq.1) then
-            write(nsyso,'('' tmin'',1p,e11.3,1p,10e11.3)')&
-              temp(itemp),tmin(itemp)
-            write(nsyso,'('' tmax'',1p,e11.3,1p,10e11.3/(16x,10e11.3))')&
-              temp(itemp),(tval(i,itemp),i=1,nbin)
-            write(nsyso,'('' prob'',1p,e11.3,1p,10e11.3/(16x,10e11.3))')&
-              temp(itemp),(tabl(i,1,itemp),i=1,nbin)
-         endif
-         write(nsyso,'(1x,a,1x,1p,e11.3,10e11.3/(16x,10e11.3))')&
-           nmr(ixx),temp(itemp),(tabl(i,ixx+1,itemp),i=1,nbin)
-      enddo
-   enddo
-   if (izeroprob.gt.0) then
-      write(strng,'(''ptable has '',i3,'' zero probability bins'')') izeroprob
-      call mess('purr',strng,' ')
-   endif
-   if (ibadxs.gt.0) then
-      write(strng,'(''ptable has '',i3,'' negative xs values'')') ibadxs
-      call mess('purr',strng,' ')
-   endif
-
-   !--compute bondarenko cross sections from prob. table
-   if (iprint.gt.0) write(nsyso,'(/&
-     &'' bondarenko cross sections from probability table''/&
-     &9x,''temp'',6x,''sig0'',4x,''p0 total'',5x,''elastic'',&
-     &5x,''fission'',5x,''capture'',4x,''p1 total'')')
-   do i=1,nsig0
-      do j=1,7
-         do itemp=1,ntemp
-            bval(j,i,itemp)=0
-         enddo
-      enddo
-      do itemp=1,ntemp
-         do j=1,nbin
-            if (tabl(j,1,itemp).ne.zero) then
-               den=sig0(i)/(sig0(i)+tabl(j,2,itemp))
-               ttt=tabl(j,1,itemp)
-               bval(1,i,itemp)=bval(1,i,itemp)+ttt*tabl(j,2,itemp)*den
-               bval(2,i,itemp)=bval(2,i,itemp)+ttt*tabl(j,3,itemp)*den
-               bval(3,i,itemp)=bval(3,i,itemp)+ttt*tabl(j,4,itemp)*den
-               bval(4,i,itemp)=bval(4,i,itemp)+ttt*tabl(j,5,itemp)*den
-               bval(5,i,itemp)=bval(5,i,itemp)+ttt*tabl(j,2,itemp)*den*den
-               bval(6,i,itemp)=bval(6,i,itemp)+ttt*den
-               bval(7,i,itemp)=bval(7,i,itemp)+ttt*den*den
-            endif
-         enddo
-         sigf(1,i,itemp)=bval(1,i,itemp)/bval(6,i,itemp)
-         sigf(2,i,itemp)=bval(2,i,itemp)/bval(6,i,itemp)
-         sigf(3,i,itemp)=bval(3,i,itemp)/bval(6,i,itemp)
-         sigf(4,i,itemp)=bval(4,i,itemp)/bval(6,i,itemp)
-         sigf(5,i,itemp)=bval(5,i,itemp)/bval(7,i,itemp)
-      enddo
-   enddo
-   if (iprint.gt.0) then
-      do itemp=1,ntemp
-         do i=1,nsig0
-            write(nsyso,'(3x,1p,2e10.3,5e12.4)')&
-              temp(itemp),sig0(i),(sigf(j,i,itemp),j=1,5)
-         enddo
-      enddo
-   endif
-
-   !--renormalize probability table and bondarenko
-   !--cross sections to the computed infinitely-dilute values
-   do itemp=1,ntemp
-      do i=2,5
-         do j=1,nbin
-            l=4*(itemp-1)
-            if (sigf(i-1,1,itemp).ne.0)&
-              tabl(j,i,itemp)=tabl(j,i,itemp)*sigi(i-1)/sigf(i-1,1,itemp)
-         enddo
-      enddo
-   enddo
-   do itemp=1,ntemp
-      do i=nsig0,1,-1
-         do j=1,5
-            k=j
-            if (j.eq.5) k=1
-            if (sigf(j,1,itemp).ne.0)&
-              sigf(j,i,itemp)=sigf(j,i,itemp)*sigi(k)/sigf(j,1,itemp)
-            sigpl(ipl,j,i)=sigf(j,i,1)
-         enddo
-      enddo
-   enddo
-     !optional printout for plotting probability per barn with viewr
-     !uncomment the following lines to activate
-     !write(nsyso,'(/'' probability per barn versus total'')')
-     !write(nsyso,'('' e='',1p,e12.4)') e
-     !tnorm=0
-     !do i=1,nbin
-     !   denom=tval(i,1)-tnorm
-     !   denom=tabl(i,1,1)/denom
-     !   write(nsyso,'(1p,2e11.4,''/'')') tabl(i,2,1),denom
-     !   tnorm=tval(i,1)
-     !enddo
    return
-   end subroutine unrest
+   end subroutine ladeval
 
    subroutine uwtab2
    !-------------------------------------------------------------------
