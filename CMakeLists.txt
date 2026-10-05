@@ -59,5 +59,13 @@ add_executable( njoy_executable
              "${CMAKE_CURRENT_SOURCE_DIR}/src/wimsr.f90" )
 set_target_properties( njoy_executable PROPERTIES OUTPUT_NAME njoy )
 
+# Optional OpenMP parallelization of purr (results are identical with or
+# without it and for any number of threads).
+option( NJOY_OPENMP "Enable OpenMP parallelization of purr" OFF )
+if( NJOY_OPENMP )
+  find_package( OpenMP COMPONENTS Fortran REQUIRED )
+  target_link_libraries( njoy_executable PRIVATE OpenMP::OpenMP_Fortran )
+endif()
+
 enable_testing()
 add_subdirectory( tests )
